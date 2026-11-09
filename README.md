@@ -9,6 +9,23 @@ This guide walks through setting up network-wide, force-enforced Pi-hole DNS fil
 - Full IPv4 + IPv6 support
 - Pi-hole addressed on a permanent internal IPv6 range (ULA) so nothing breaks when your ISP's delegated prefix changes
 
+## Table of Contents
+
+1. [Part 1 — IPv6 Prefix Delegation on WAN](#part-1--ipv6-prefix-delegation-on-wan)
+2. [Part 2 — Give Each VLAN Its Own /64](#part-2--give-each-vlan-its-own-64)
+3. [Part 3 — Give Pi-hole a Permanent Address (ULA)](#part-3--give-pi-hole-a-permanent-address-ula)
+4. [Part 4 — Firewall Aliases](#part-4--firewall-aliases)
+5. [Part 5 — Router Advertisements](#part-5--router-advertisements-per-vlan)
+6. [Part 6 — Force DNS via NAT Redirect](#part-6--force-dns-via-nat-redirect-per-vlan)
+7. [Part 7 — Test](#part-7--test)
+8. [Troubleshooting](#troubleshooting)
+9. [Part 8 — Firewall Rules Reference](#part-8--firewall-rules-reference)
+10. [Part 9 — Block LAN IPv6 to Trusted/Cameras](#part-9--block-lan-ipv6-to-trustedcameras-prefix-stable)
+11. [Part 10 — DHCP Options](#part-10--dhcp-options)
+12. [Part 11 — Unbound Setting](#part-11--unbound-setting)
+13. [Part 12 — Access List](#part-12--access-list)
+14. [Part 13 — DNS Server List](#part-13--dns-server-list)
+
 ## Prerequisites
 
 - OPNsense already installed, with your VLANs created as separate interfaces (this guide assumes 5: LAN + 4 others, e.g. IoT, Guest, Trusted, Cameras — adjust to your own setup)
@@ -73,7 +90,7 @@ Firewall → Aliases → Add these:
 | `PrivateNetworks` | Network(s) | `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` |
 | `PrivateNetworks_IPv6` | Network(s) | `fc00::/7`, `fe80::/10` |
 | `LAN_Restricted_v4` | Network(s) | `10.0.10.0/24`, `10.0.40.0/24` (Trusted & Cameras subnets) |
-| `LAN_Restricted_v6` | Network(s) | `_opt5_network`, `opt6_network` (Trusted & Cameras VLAN interfaces) |
+| `LAN_Restricted_v6` | Network(s) | `__opt5_network`, `__opt6_network` (Trusted & Cameras VLAN interfaces — see Part 9) |
 
 Add a `_Restricted` alias per VLAN if you want to block specific VLANs from reaching each other (e.g. general LAN devices shouldn't reach security cameras).
 
@@ -103,7 +120,7 @@ Firewall → NAT → Port Forward, for each VLAN, create both an IPv4 and IPv6 v
 | Redirect target port | 53 |
 | Filter rule association | Pass (auto-creates the matching filter rule) |
 
-**Critical step — don't skip this:** Firewall → Settings → Advanced → under Network Address Translation, check "Reflection for destination NAT." Without this, devices on the same subnet as Pi-hole will get DNS replies that appear to come from an unexpected address and get silently dropped by the client OS — this presents as random, hard-to-diagnose "no internet" on some devices and not others.
+> ⚠️ **Critical step — don't skip this:** Firewall → Settings → Advanced → under Network Address Translation, check **"Reflection for destination NAT."** Without this, devices on the same subnet as Pi-hole will get DNS replies that appear to come from an unexpected address and get silently dropped by the client OS — this presents as random, hard-to-diagnose "no internet" on some devices and not others.
 
 ### Exclude Pi-hole's own queries on whichever VLAN hosts it
 
@@ -211,7 +228,7 @@ The full rule set below reflects a working 5-VLAN layout (LAN + IoT + Guest + Tr
 
 ## Part 9 — Block LAN IPv6 to Trusted/Cameras (Prefix-Stable)
 
-The IPv4 block (LAN → LAN_Restricted_v4, sequence 2050) only covers IPv4. LAN's IPv6 catch-all (sequence 2200, "Default Allow LAN IPv6 to any") has nothing blocking Trusted or Cameras ahead of it, so an IPv6-capable device on LAN can currently reach both over v6 even though v4 access is blocked.
+The IPv4 block (LAN → `LAN_Restricted_v4`, sequence 2050) only covers IPv4. LAN's IPv6 catch-all (sequence 2200, "Default Allow LAN IPv6 to any") has nothing blocking Trusted or Cameras ahead of it, so an IPv6-capable device on LAN can currently reach both over v6 even though v4 access is blocked.
 
 Don't build this as a static alias of typed-in IPv6 prefixes. Trusted and Cameras get their IPv6 `/64`s via tracked IPv6 off the WAN's DHCPv6-PD delegation (Part 2) — if the ISP reshuffles the delegated prefix, a hand-typed alias goes stale silently: the rule stops matching the real subnet and quietly stops blocking anything, with no error to tip you off.
 
@@ -232,7 +249,41 @@ To add it:
 9. Source: LAN net.
 10. Destination: `LAN_Restricted_v6`.
 11. Description: "Blocks Lan to Trusted, Cameras Devices IPv6."
-12. Save, then drag it into position between the existing 2050 (LAN_Restricted_v4 block) rule and 2200 ("Default Allow LAN IPv6 to any") — it must evaluate before the v6 catch-all or the catch-all will pass the traffic first.
+12. Save, then drag it into position between the existing 2050 (`LAN_Restricted_v4` block) rule and 2200 ("Default Allow LAN IPv6 to any") — it must evaluate before the v6 catch-all or the catch-all will pass the traffic first.
 13. Apply.
 
 Once in place, the LAN row in the Part 8 reference table above is complete for both protocols, and the same LAN → IoT/Guest-yes, LAN → Trusted/Cameras-no, Trusted → everything-yes policy holds identically whether the ISP's delegated prefix changes or not.
+
+## Part 10 — DHCP Options
+
+Set up DHCP options so clients are handed your Pi-holes as their DNS servers.
+
+1. Under the DHCP options, set Interface to `LAN` to start.
+2. Under **Type**, select `Set`.
+3. Under **Option**, select `dns-server [6]`. Leave **Option6** as `None`.
+4. For **Value**, add the IPv4 addresses of your Pi-hole servers (example: `10.0.0.2,10.0.0.3`).
+5. Ensure **Force** is enabled.
+6. Add a description (example: `Pi-Hole DNS`).
+7. Repeat these steps for each VLAN you have (example: Trusted, IoT, Guest, & Cameras).
+
+![Edit DHCP option dialog](images/dhcp-option.png)
+
+## Part 11 — Unbound Setting
+
+Make sure **"Enable Unbound" is disabled** in OPNsense. We don't want to use OPNsense as the Unbound server — Pi-hole is the resolver instead.
+
+## Part 12 — Access List
+
+1. Create a name (example: `PiHole_DNS`).
+2. Under **Action**, select `Allow`.
+3. Under **Networks**, add your Pi-hole IPv4 addresses (example: `10.0.0.2/32` & `10.0.0.3/32`).
+4. Add a **Description** (example: `Allow Access Pi-Hole DNS`).
+
+![Edit ACL dialog](images/unbound-acl.png)
+
+## Part 13 — DNS Server List
+
+1. Go to System → Settings → General and scroll down to the **DNS servers** section.
+2. Add the IPv4 and IPv6 addresses of each Pi-hole.
+3. In the DNS server options, **disable** "Allow DNS server list to be overridden by DHCP/PPP on WAN".
+4. **Enable** "Do not use the local DNS service as a name server for this system".
